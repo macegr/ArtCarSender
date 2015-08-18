@@ -1,5 +1,6 @@
-// Art Car 2011
+// Art Car Drive-by-Wire
 // Sender Module
+// Input: Throttle lever (potentiometer), steering wheel (potentiometer)
 // Garrett Mace
 
 // Control ADC smoothing ratio
@@ -55,46 +56,20 @@
 // Global variables
 int steerValue = 1500;
 int steerInCenterCal = 511;
-
 int brakeValue = 180;
 int throttleValue = throttleDefault;
-
-
-
 float steerSmoothed = 0;
 float speedSmoothed = 0;
-
 float steerTrimSmoothed = 0;
 float brakeTrimSmoothed = 0;
 
-// Initialize sequence
-void setup()
-{
-  
-  Serial.begin(57600);
-  
-  pinMode(statusLED, OUTPUT);
-  digitalWrite(statusLED,HIGH);
-  
-  pinMode(enableRS485, OUTPUT);
-  
-  
-  int steerCalAvg;
-  
-  for (int i = 0; i < 15; i++) {
-    steerCalAvg += analogRead(steerADC);
-  }
-  
-  steerInCenterCal = steerCalAvg / 15;
-  
-  
-}
-
-
+// Receive buffer size
 #define recvMax 13
 int recvIndex = 0;
 char recvBuffer[recvMax] = {0};
+byte sendBuffer[13] = {0};
 
+// Communcation state definitions
   #define IDLE 0
   #define RECEIVE 1
   #define TRANSMIT 2
@@ -105,8 +80,36 @@ char recvBuffer[recvMax] = {0};
 int packetState = IDLE;
 
 
-byte sendBuffer[13] = {0};
+// Initialize sequence
+void setup()
+{
 
+  // Activate serial port
+  Serial.begin(57600);
+
+  // Communication status LED
+  pinMode(statusLED, OUTPUT);
+  digitalWrite(statusLED,HIGH);
+
+  // RS485 flow control pin
+  pinMode(enableRS485, OUTPUT);
+  digitalWrite(enableRS485, LOW);
+  
+  
+  // Calibrate steering on startup
+  int steerCalAvg;
+  for (int i = 0; i < 15; i++) {
+    steerCalAvg += analogRead(steerADC);
+  }
+  steerInCenterCal = steerCalAvg / 15;
+ 
+}
+
+
+
+
+
+// Run CRC on data to be sent
 byte doChecksum(void) {
  byte crc = 0, i;
  for (i = 0; i < 12; i++) {
@@ -116,11 +119,11 @@ byte doChecksum(void) {
 }
 
 
+// Check receive buffer for valid packet and store the data
 void checkRS485()
 {
   byte tempByte;
   byte serialFloodDetect = 0;
-  
   
   while (Serial.available() > 0 && serialFloodDetect < 50)
   {
@@ -128,16 +131,16 @@ void checkRS485()
     tempByte = Serial.read();
     serialFloodDetect++;
    
-   
     if (packetState == RECEIVE) { 
       // end of packet
-      if (tempByte == 0x03) {   
+      if (tempByte == 0x03) {
+        // Quick and dirty check for ACK packet from receiver   
         if (recvBuffer[recvIndex-2] == char('O') && recvBuffer[recvIndex-1] == char('K')) {
           packetState = RXDONE;
         } else {
           packetState = ERROR;
         }
-        // receive data
+      // receive data
       } else if (recvIndex < recvMax) {
         recvBuffer[recvIndex] = tempByte;
         recvIndex++;
@@ -159,7 +162,7 @@ void checkRS485()
   
 }
 
-
+// Pad number with leading zeros if needed
 String leadZeroes(int value, int minlength) {
   String tempString = String(value, DEC);
   int tempLength = tempString.length();
@@ -171,19 +174,7 @@ String leadZeroes(int value, int minlength) {
   return tempString;
 }
 
-
-void wait_for_done()
-{
-  char timeout = 15;  // delay in 100 us units
-  
-  UCSR0A |= 1<<TXC0;  // clear flag!
-  while((UCSR0A&(1<<TXC0)) == 0) {
-     delayMicroseconds(100);
-     if (--timeout <= 0)
-        break;
-  }
-}
-
+// Generate the control packet
 void buildPacket() {
 
   String tempString = leadZeroes(steerValue,4) + leadZeroes(brakeValue,4) + leadZeroes(throttleValue,4);
@@ -206,7 +197,7 @@ void buildPacket() {
   
 }
 
-
+// Sample and smooth analog input values
 void readAnalogs() {
  
   steerSmoothed = steerSmoothed * (1.0 - steerSmoothing) + analogRead(steerADC) * steerSmoothing;
@@ -217,10 +208,13 @@ void readAnalogs() {
   
 }
 
+// Process analog values and convert to command values
 void calcOutputs() {
 
+  // Apply adjustable brake offset from trimpot
   int brakeOffset =  (brakeTrimSmoothed - 511) / 8;
-  
+
+  // When throttle is below a certain point, apply brakes
   if (speedSmoothed > brakeInMax-brakeInMaxDeadZone) {
     brakeValue = brakeMax;
   } else if (speedSmoothed < brakeInMin+brakeInMinDeadZone) {
@@ -230,7 +224,8 @@ void calcOutputs() {
   } else if (speedSmoothed < brakeInMax-brake25Point && speedSmoothed >= brakeInMin) {
     brakeValue = map(speedSmoothed, brakeInMin, brakeInMax-brake25Point, brakeMin, brakeMax*0.80) + brakeOffset;
   } 
-  
+
+  // When throttle is above a certain point, apply throttle
   if (speedSmoothed > throttleInMax-throttleInMaxDeadZone) {
     throttleValue = throttleMax;
   } else if (speedSmoothed < throttleInMin+throttleInMinDeadZone) {
@@ -242,12 +237,10 @@ void calcOutputs() {
   if (throttleValue >= 255) throttleValue = 255;
   if (throttleValue <= 0) throttleValue = 0;
   
-  
+  // Apply adjustable steering offset from trimpot
   int steerOffset =  (steerTrimSmoothed - 511) / 2;
   
-  //Serial.println(throttleValue);
-  
-    
+  // Generate steering values  
   if (steerSmoothed >= steerInMax) {
     steerValue = steerMax + steerOffset;
   } else if (steerSmoothed <= steerInMin) {
@@ -257,10 +250,6 @@ void calcOutputs() {
   } else if (steerSmoothed < steerInCenterCal+steerWidth && steerSmoothed > steerInCenterCal-steerWidth) {
     steerValue = map(steerSmoothed, steerInCenterCal-steerWidth, steerInCenterCal+steerWidth, steerMin, steerMax) + steerOffset;
   }
-  
-  
-  //Serial.print(steerSmoothed); Serial.print(" ");
-  //Serial.println(steerValue);
   
 }
 
@@ -278,26 +267,33 @@ void loop()
 
   checkRS485();
 
-  if (millis() > activityAnalogTimer) {
+  long currentMillis;
+
+  // Read analog values every 10 milliseconds
+  currentMillis = millis();
+  if (currentMillis - activityAnalogTimer > 10) {
     readAnalogs();
-    activityAnalogTimer = millis() + 5;
+    activityAnalogTimer = currentMillis;
   }
 
-  if (millis() > activityPacketTimer) {
+  // Send data packet every 50 milliseconds
+  currentMillis = millis();
+  if (currentMillis - activityPacketTimer > 50) {
     calcOutputs();
     buildPacket();
-    activityPacketTimer = millis() + 50;
+    activityPacketTimer = currentMillis;
   }
 
+  // Handle packet state and status LED
   if (packetState == RXDONE) {
     packetState = IDLE;
     digitalWrite(statusLED, LOW);
     activityFlag = 1;
-    activityLEDTimer = millis()+10;
+    activityLEDTimer = millis();
  }
 
-  
-  if (activityFlag == 1 && millis() > activityLEDTimer) {
+  // Turn status LED back on after 10 milliseconds
+  if (activityFlag == 1 && (millis() - activityLEDTimer) > 10) {
     activityFlag = 0;
     digitalWrite(statusLED, HIGH);
   }
