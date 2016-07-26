@@ -3,6 +3,13 @@
 // Input: Throttle lever (potentiometer), steering wheel (potentiometer)
 // Garrett Mace
 
+#include <EEPROM.h>
+
+// Turbo boost implementation
+#define TURBOMS 1000
+#define NORMALTHROTTLE 160
+#define TURBOHYSTERESIS 80
+
 // Control ADC smoothing ratio
 #define steerSmoothing 0.1
 #define speedSmoothing 0.1
@@ -14,11 +21,11 @@
 #define steerInMin 0
 #define steerInCenter 511
 #define steerInDeadZone 5
-#define steerWidth 500
+#define steerWidth 900
 
 // Braking input range
-#define brakeInMax 546
-#define brakeInMin 130
+#define brakeInMax 570
+#define brakeInMin 20
 #define brakeInMaxDeadZone 20
 #define brakeInMinDeadZone 10
 #define brake25Point 250
@@ -30,14 +37,20 @@
 #define throttleInMinDeadZone 10
 
 // Steering output range
-#define steerMax 2000
-#define steerMin 1000
+#define steerMax 1750
+#define steerMin 1250
 #define steerDefault 1500
 
+#define steerHardLimitMax 1900
+#define steerHardLimitMin 1100
+// Brakes just touch 1824
+// Max braking 1570
+
+
 // Braking output range
-#define brakeMax 2400
-#define brakeMin 600
-#define brakeDefault 0
+#define brakeMax 1900
+#define brakeMin 1570
+#define brakeDefault 1600
 
 // Throttle output range
 #define throttleMax 255
@@ -54,7 +67,7 @@
 #define statusLED 10
 
 // Global variables
-int steerValue = 1500;
+int steerValue = steerDefault;
 int steerInCenterCal = 511;
 int brakeValue = 180;
 int throttleValue = throttleDefault;
@@ -62,6 +75,9 @@ float steerSmoothed = 0;
 float speedSmoothed = 0;
 float steerTrimSmoothed = 0;
 float brakeTrimSmoothed = 0;
+boolean turboBoostAllowed = true;
+boolean turboBoosting = false;
+long turboBoostTimer;
 
 // Receive buffer size
 #define recvMax 13
@@ -212,18 +228,17 @@ void readAnalogs() {
 void calcOutputs() {
 
   // Apply adjustable brake offset from trimpot
-  int brakeOffset =  (brakeTrimSmoothed - 511) / 8;
+  //int brakeOffset =  (brakeTrimSmoothed - 511) / 8;
 
   // When throttle is below a certain point, apply brakes
   if (speedSmoothed > brakeInMax-brakeInMaxDeadZone) {
     brakeValue = brakeMax;
   } else if (speedSmoothed < brakeInMin+brakeInMinDeadZone) {
     brakeValue = brakeMin;
-  } else if (speedSmoothed <= brakeInMax && speedSmoothed >= brakeInMax-brake25Point) {
-    brakeValue = map(speedSmoothed, brakeInMax-brake25Point, brakeInMax, brakeMax*0.80, brakeMax) + brakeOffset;
-  } else if (speedSmoothed < brakeInMax-brake25Point && speedSmoothed >= brakeInMin) {
-    brakeValue = map(speedSmoothed, brakeInMin, brakeInMax-brake25Point, brakeMin, brakeMax*0.80) + brakeOffset;
-  } 
+  } else if (speedSmoothed <= brakeInMax && speedSmoothed >= brakeInMin) {
+    //brakeValue = map(speedSmoothed, brakeInMin, brakeInMax, brakeMin+brakeOffset, brakeMax);
+    brakeValue = map(speedSmoothed, brakeInMin, brakeInMax, brakeMin, brakeMax);
+  }
 
   // When throttle is above a certain point, apply throttle
   if (speedSmoothed > throttleInMax-throttleInMaxDeadZone) {
@@ -236,6 +251,21 @@ void calcOutputs() {
   
   if (throttleValue >= 255) throttleValue = 255;
   if (throttleValue <= 0) throttleValue = 0;
+
+  if (throttleValue >= NORMALTHROTTLE) {
+    if (turboBoostAllowed == true) {
+      if (turboBoosting == false) {
+        turboBoostTimer = millis();
+        turboBoosting = true;
+      }
+    } else {
+      throttleValue = NORMALTHROTTLE;
+    }
+} else if (throttleValue < (NORMALTHROTTLE - TURBOHYSTERESIS)) {
+   turboBoostAllowed = true;
+   turboBoosting = false;
+ }
+  
   
   // Apply adjustable steering offset from trimpot
   int steerOffset =  (steerTrimSmoothed - 511) / 2;
@@ -245,11 +275,21 @@ void calcOutputs() {
     steerValue = steerMax + steerOffset;
   } else if (steerSmoothed <= steerInMin) {
     steerValue = steerMin + steerOffset;
-  } else if (steerSmoothed <= steerInCenterCal+steerInDeadZone && steerSmoothed >= steerInCenterCal-steerInDeadZone) {
+  } else {
+    steerValue = map(steerSmoothed, steerInMin, steerInMax, steerMin, steerMax) + steerOffset;
+  }
+  
+  
+  /*else if (steerSmoothed <= steerInCenterCal+steerInDeadZone && steerSmoothed >= steerInCenterCal-steerInDeadZone) {
     steerValue = steerDefault + steerOffset;
   } else if (steerSmoothed < steerInCenterCal+steerWidth && steerSmoothed > steerInCenterCal-steerWidth) {
     steerValue = map(steerSmoothed, steerInCenterCal-steerWidth, steerInCenterCal+steerWidth, steerMin, steerMax) + steerOffset;
   }
+  */
+
+  if (steerValue > steerHardLimitMax) steerValue = steerHardLimitMax;
+  if (steerValue < steerHardLimitMin) steerValue = steerHardLimitMin;
+
   
 }
 
@@ -272,16 +312,23 @@ void loop()
   // Read analog values every 10 milliseconds
   currentMillis = millis();
   if (currentMillis - activityAnalogTimer > 10) {
-    readAnalogs();
     activityAnalogTimer = currentMillis;
+    readAnalogs();
+  }
+
+
+  // check the turbo boost timer and disable turbo after delay
+  if (turboBoosting == true) {
+    if (currentMillis - turboBoostTimer > TURBOMS) {
+        turboBoostAllowed = false; 
+    }
   }
 
   // Send data packet every 50 milliseconds
-  currentMillis = millis();
   if (currentMillis - activityPacketTimer > 50) {
+    activityPacketTimer = currentMillis;
     calcOutputs();
     buildPacket();
-    activityPacketTimer = currentMillis;
   }
 
   // Handle packet state and status LED
